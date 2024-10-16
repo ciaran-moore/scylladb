@@ -223,7 +223,7 @@ def colorprint(msg, **kwargs):
 
 def parse_scylla_dirs_with_default(conf='/etc/scylla/scylla.yaml'):
     y = yaml.safe_load(open(conf))
-    if 'workdir' not in y or not y['workdir']:
+    if y is None or 'workdir' not in y or not y['workdir']:
         y['workdir'] = datadir()
     if 'data_file_directories' not in y or \
             not y['data_file_directories'] or \
