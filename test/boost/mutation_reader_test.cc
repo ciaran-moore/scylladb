@@ -50,7 +50,6 @@
 #include "partition_slice_builder.hh"
 #include "schema/schema_registry.hh"
 #include "utils/assert.hh"
-#include "utils/ranges.hh"
 #include "mutation/mutation_rebuilder.hh"
 
 #include "readers/from_mutations_v2.hh"
@@ -451,9 +450,9 @@ std::vector<dht::decorated_key> generate_keys(schema_ptr s, int count) {
 }
 
 std::vector<dht::ring_position> to_ring_positions(const std::vector<dht::decorated_key>& keys) {
-    return ranges::to<std::vector<dht::ring_position>>(keys | boost::adaptors::transformed([] (const dht::decorated_key& key) {
+    return keys | std::views::transform([] (const dht::decorated_key& key) {
         return dht::ring_position(key);
-    }));
+    }) | std::ranges::to<std::vector>();
 }
 
 SEASTAR_TEST_CASE(test_fast_forwarding_combining_reader) {
@@ -488,9 +487,9 @@ SEASTAR_TEST_CASE(test_fast_forwarding_combining_reader) {
         };
 
         auto make_reader = [&] (reader_permit permit, const dht::partition_range& pr) {
-            return make_combined_reader(s, permit, ranges::to<std::vector<mutation_reader>>(mutations | boost::adaptors::transformed([&pr, s, permit] (auto& ms) {
+            return make_combined_reader(s, permit, mutations | std::views::transform([&pr, s, permit] (auto& ms) {
                 return make_mutation_reader_from_mutations_v2(s, permit, {ms}, pr);
-            })));
+            }) | std::ranges::to<std::vector>());
         };
 
         auto pr = dht::partition_range::make_open_ended_both_sides();
@@ -1244,9 +1243,10 @@ SEASTAR_THREAD_TEST_CASE(test_foreign_reader_as_mutation_source) {
     do_with_cql_env_thread([] (cql_test_env& env) -> future<> {
         auto populate = [&env] (schema_ptr s, const std::vector<mutation>& mutations) {
             const auto remote_shard = (this_shard_id() + 1) % smp::count;
-            auto frozen_mutations = ranges::to<std::vector<frozen_mutation>>(
+            auto frozen_mutations =
                 mutations
-                | boost::adaptors::transformed([] (const mutation& m) { return freeze(m); }));
+                | std::views::transform([] (const mutation& m) { return freeze(m); })
+                | std::ranges::to<std::vector>();
             auto remote_mt = smp::submit_to(remote_shard, [s = global_schema_ptr(s), &frozen_mutations] {
                 auto mt = make_lw_shared<replica::memtable>(s.get());
 
@@ -1371,13 +1371,15 @@ SEASTAR_TEST_CASE(test_trim_clustering_row_ranges_to) {
 
     const auto check = [](std::vector<range> ranges, key key, std::vector<range> output_ranges, schema_ptr schema,
             seastar::compat::source_location sl = seastar::compat::source_location::current()) {
-        auto actual_ranges = ranges::to<query::clustering_row_ranges>(ranges | boost::adaptors::transformed(
-                    [&] (const range& r) { return r.to_clustering_range(*schema); }));
+        auto actual_ranges = ranges | std::views::transform(
+                    [&] (const range& r) { return r.to_clustering_range(*schema); })
+            | std::ranges::to<query::clustering_row_ranges>();
 
         query::trim_clustering_row_ranges_to(*schema, actual_ranges, key.to_clustering_key(*schema));
 
-        const auto expected_ranges = ranges::to<query::clustering_row_ranges>(output_ranges | boost::adaptors::transformed(
-                    [&] (const range& r) { return r.to_clustering_range(*schema); }));
+        const auto expected_ranges = output_ranges | std::views::transform(
+                    [&] (const range& r) { return r.to_clustering_range(*schema); })
+            | std::ranges::to<query::clustering_row_ranges>();
 
         if (!std::equal(actual_ranges.begin(), actual_ranges.end(), expected_ranges.begin(), expected_ranges.end(),
                     [tri_cmp = clustering_key::tri_compare(*schema)] (const query::clustering_range& a, const query::clustering_range& b) {
@@ -4283,4 +4285,76 @@ SEASTAR_THREAD_TEST_CASE(test_generating_reader_v2) {
         });
     };
     run_mutation_source_tests(populator_v2, false);
+}
+
+// Check that the multishard reader is safe to create with an admitted permit,
+// i.e. a permit which already has a count resource (and memory resources).
+// Create semaphroes with a single count resource, admit a permit and create a
+// multishard reader with said permit and ensure this doesn't end up in a
+// deadlock (timeout) when the multishard reader creates the shard reader on the
+// same shard.
+SEASTAR_TEST_CASE(test_multishard_reader_safe_to_create_with_admitted_permit) {
+    class semaphore_factory : public test_reader_lifecycle_policy::semaphore_factory {
+        std::vector<foreign_ptr<lw_shared_ptr<reader_concurrency_semaphore>>>& _semaphores;
+    public:
+        explicit semaphore_factory(std::vector<foreign_ptr<lw_shared_ptr<reader_concurrency_semaphore>>>& semaphores) : _semaphores(semaphores) { }
+        virtual lw_shared_ptr<reader_concurrency_semaphore> create(sstring name) override {
+            auto semaphore = _semaphores.at(this_shard_id()).release();
+            _semaphores[this_shard_id()] = make_foreign(semaphore);
+            return semaphore;
+        }
+        virtual future<> stop(reader_concurrency_semaphore& semaphore) override {
+            return make_ready_future<>(); // NOOP, we stop the semaphore in the layer above
+        }
+    };
+
+    return do_with_cql_env_thread([] (cql_test_env& env) {
+        simple_schema s;
+
+        std::vector<foreign_ptr<lw_shared_ptr<reader_concurrency_semaphore>>> semaphores;
+        semaphores.resize(smp::count);
+        parallel_for_each(std::views::iota(0u, smp::count), [&semaphores] (shard_id shard) {
+            return smp::submit_to(shard, [&semaphores] {
+                semaphores[this_shard_id()] = make_foreign(make_lw_shared<reader_concurrency_semaphore>(
+                        reader_concurrency_semaphore::for_tests{},
+                        seastar::format("{}:{}", get_name(), this_shard_id()),
+                        1,
+                        1 * 1024 * 1024));
+            });
+        }).get();
+        auto stop_semaphores = defer([&semaphores] {
+            parallel_for_each(std::views::iota(0u, smp::count), [&semaphores] (shard_id shard) {
+                return smp::submit_to(shard, [&semaphores] () -> future<> {
+                    auto semaphore = semaphores[this_shard_id()].release();
+                    co_await semaphore->stop();
+                });
+            }).get();
+        });
+
+        std::map<dht::token, unsigned> pkeys_by_tokens;
+        for (unsigned i = 0; i < smp::count * 2; ++i) {
+            pkeys_by_tokens.emplace(s.make_pkey(i).token(), i);
+        }
+        auto sharder = std::make_unique<dummy_sharder>(s.schema()->get_sharder(), std::move(pkeys_by_tokens));
+
+        auto reader_factory = [] (
+                schema_ptr schema,
+                reader_permit permit,
+                const dht::partition_range&,
+                const query::partition_slice&,
+                tracing::trace_state_ptr,
+                mutation_reader::forwarding) {
+            return make_empty_flat_reader_v2(std::move(schema), std::move(permit));
+        };
+
+        // timeout is used to break the deadlock in case this test fails
+        auto permit = semaphores.at(this_shard_id())->obtain_permit(s.schema(), "multishard_reader", 128 * 1024, db::timeout_clock::now() + 60s, {}).get();
+        auto lifecycle_policy = seastar::make_shared<test_reader_lifecycle_policy>(reader_factory, std::make_unique<semaphore_factory>(semaphores));
+
+        auto reader = make_multishard_combining_reader_v2_for_tests(*sharder, std::move(lifecycle_policy), s.schema(), std::move(permit),
+                query::full_partition_range, s.schema()->full_slice());
+        auto close_reader = deferred_close(reader);
+
+        reader().get();
+    });
 }

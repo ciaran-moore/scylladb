@@ -8,9 +8,9 @@
  * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
  */
 
-#include <boost/range/adaptors.hpp>
 #include <boost/range/algorithm/equal.hpp>
 #include <boost/range/algorithm/transform.hpp>
+#include <boost/range/adaptor/reversed.hpp>
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include <boost/algorithm/cxx11/all_of.hpp>
 
@@ -23,6 +23,8 @@
 #include "cql3/expr/expr-utils.hh"
 #include "cql3/functions/first_function.hh"
 #include "cql3/functions/aggregate_fcts.hh"
+
+#include <ranges>
 
 namespace cql3 {
 
@@ -443,14 +445,15 @@ std::vector<const column_definition*> selection::wildcard_columns(schema_ptr sch
     // filter out hidden columns, which should not be seen by the
     // user when doing "SELECT *". We also disallow selecting them
     // individually (see column_identifier::new_selector_factory()).
-    return boost::copy_range<std::vector<const column_definition*>>(
+    return
         columns |
-        boost::adaptors::filtered([](const column_definition& c) {
+        std::views::filter([](const column_definition& c) {
             return !c.is_hidden_from_cql();
         }) |
-        boost::adaptors::transformed([](const column_definition& c) {
+        std::views::transform([](const column_definition& c) {
             return &c;
-        }));
+        }) |
+        std::ranges::to<std::vector>();
 }
 
 ::shared_ptr<selection> selection::wildcard(schema_ptr schema) {

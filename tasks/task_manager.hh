@@ -9,7 +9,8 @@
 #pragma once
 
 #include <list>
-#include <boost/range/adaptors.hpp>
+#include <boost/range/adaptor/map.hpp>
+#include <boost/range/adaptor/filtered.hpp>
 #include <boost/range/algorithm/transform.hpp>
 #include <boost/range/join.hpp>
 #include <seastar/core/on_internal_error.hh>
@@ -162,6 +163,7 @@ public:
             future<> for_each_task(std::function<future<>(const foreign_task_ptr&)> f_children,
                     std::function<future<>(const task_essentials&)> f_finished_children) const;
 
+            // Make sure there is no race between map_children and the child's owner shard.
             template<typename Res>
             future<std::vector<Res>> map_each_task(std::function<std::optional<Res>(const foreign_task_ptr&)> map_children,
                     std::function<std::optional<Res>(const task_essentials&)> map_finished_children) const {
